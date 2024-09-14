@@ -155,6 +155,25 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
+class Basic2DPositionEmbeddingMixin(BaseMixin):
+    def __init__(self, height, width, compressed_num_frames, hidden_size, text_length=0):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.spatial_length = height * width
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(1, int(text_length + self.spatial_length), int(hidden_size)), requires_grad=False
+        )
+
+    def position_embedding_forward(self, position_ids, **kwargs):
+        return self.pos_embedding
+
+    def reinit(self, parent_model=None):
+        del self.transformer.position_embeddings
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embedding.shape[-1], self.height, self.width)
+        self.pos_embedding.data[:, -self.spatial_length :].copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+
 class Basic3DPositionEmbeddingMixin(BaseMixin):
     def __init__(
         self,
@@ -240,7 +259,6 @@ class Rotary3DPositionEmbeddingMixin(BaseMixin):
         text_length,
         theta=10000,
         rot_v=False,
-        pnp=False,
         learnable_pos_embed=False,
     ):
         super().__init__()
@@ -250,7 +268,6 @@ class Rotary3DPositionEmbeddingMixin(BaseMixin):
         dim_h = hidden_size_head // 8 * 3
         dim_w = hidden_size_head // 8 * 3
 
-        # 'lang':
         freqs_t = 1.0 / (theta ** (torch.arange(0, dim_t, 2)[: (dim_t // 2)].float() / dim_t))
         freqs_h = 1.0 / (theta ** (torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h))
         freqs_w = 1.0 / (theta ** (torch.arange(0, dim_w, 2)[: (dim_w // 2)].float() / dim_w))
@@ -268,12 +285,7 @@ class Rotary3DPositionEmbeddingMixin(BaseMixin):
         freqs_w = repeat(freqs_w, "... n -> ... (n r)", r=2)
 
         freqs = broadcat((freqs_t[:, None, None, :], freqs_h[None, :, None, :], freqs_w[None, None, :, :]), dim=-1)
-        # (T H W D)
-
-        self.pnp = pnp
-
-        if not self.pnp:
-            freqs = rearrange(freqs, "t h w d -> (t h w) d")
+        freqs = rearrange(freqs, "t h w d -> (t h w) d")
 
         freqs = freqs.contiguous()
         freqs_sin = freqs.sin()
@@ -289,32 +301,14 @@ class Rotary3DPositionEmbeddingMixin(BaseMixin):
             self.pos_embedding = None
 
     def rotary(self, t, **kwargs):
-        if self.pnp:
-            t_coords = kwargs["rope_position_ids"][:, :, 0]
-            x_coords = kwargs["rope_position_ids"][:, :, 1]
-            y_coords = kwargs["rope_position_ids"][:, :, 2]
-            mask = (x_coords != -1) & (y_coords != -1) & (t_coords != -1)
-            freqs = torch.zeros([t.shape[0], t.shape[2], t.shape[3]], dtype=t.dtype, device=t.device)
-            freqs[mask] = self.freqs[t_coords[mask], x_coords[mask], y_coords[mask]]
-
-        else:
-
-            def reshape_freq(freqs):
-                frame = t.shape[2]
-                freqs = freqs[:frame].contiguous()
-                freqs = freqs.unsqueeze(0).unsqueeze(0)
-                return freqs
-
-            freqs_cos = reshape_freq(self.freqs_cos)
-            freqs_sin = reshape_freq(self.freqs_sin)
+        seq_len = t.shape[2]
+        freqs_cos = self.freqs_cos[:seq_len].unsqueeze(0).unsqueeze(0)
+        freqs_sin = self.freqs_sin[:seq_len].unsqueeze(0).unsqueeze(0)
 
         return t * freqs_cos + rotate_half(t) * freqs_sin
 
     def position_embedding_forward(self, position_ids, **kwargs):
-        if self.pos_embedding is not None:
-            return self.pos_embedding[:, : self.text_length + kwargs["seq_length"]]
-        else:
-            return None
+        return None
 
     def attention_fn(
         self,
@@ -329,64 +323,10 @@ class Rotary3DPositionEmbeddingMixin(BaseMixin):
     ):
         attention_fn_default = HOOKS_DEFAULT["attention_fn"]
 
-        if self.pnp:
-            query_layer = self.rotary(query_layer, **kwargs)
-            key_layer = self.rotary(key_layer, **kwargs)
-            if self.rot_v:
-                value_layer = self.rotary(value_layer)
-        else:
-            query_layer = torch.cat(
-                (
-                    query_layer[
-                        :,
-                        :,
-                        : kwargs["text_length"],
-                    ],
-                    self.rotary(
-                        query_layer[
-                            :,
-                            :,
-                            kwargs["text_length"] :,
-                        ]
-                    ),
-                ),
-                dim=2,
-            )
-            key_layer = torch.cat(
-                (
-                    key_layer[
-                        :,
-                        :,
-                        : kwargs["text_length"],
-                    ],
-                    self.rotary(
-                        key_layer[
-                            :,
-                            :,
-                            kwargs["text_length"] :,
-                        ]
-                    ),
-                ),
-                dim=2,
-            )
-            if self.rot_v:
-                value_layer = torch.cat(
-                    (
-                        value_layer[
-                            :,
-                            :,
-                            : kwargs["text_length"],
-                        ],
-                        self.rotary(
-                            value_layer[
-                                :,
-                                :,
-                                kwargs["text_length"] :,
-                            ]
-                        ),
-                    ),
-                    dim=2,
-                )
+        query_layer[:, :, self.text_length :] = self.rotary(query_layer[:, :, self.text_length :])
+        key_layer[:, :, self.text_length :] = self.rotary(key_layer[:, :, self.text_length :])
+        if self.rot_v:
+            value_layer[:, :, self.text_length :] = self.rotary(value_layer[:, :, self.text_length :])
 
         return attention_fn_default(
             query_layer,
@@ -448,7 +388,6 @@ class FinalLayerMixin(BaseMixin):
 
     def final_forward(self, logits, **kwargs):
         x, emb = logits[:, kwargs["text_length"] :, :], kwargs["emb"]  # x:(b,(t n),d)
-
         shift, scale = self.adaLN_modulation(emb).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
@@ -544,6 +483,7 @@ class AdaLNMixin(BaseMixin):
         # hidden_states (b,(n_t+t*n_i),d)
         text_hidden_states = hidden_states[:, :text_length]  # (b,n,d)
         img_hidden_states = hidden_states[:, text_length:]  # (b,(t n),d)
+
         layer = self.transformer.layers[kwargs["layer_id"]]
         adaLN_modulation = self.adaLN_modulations[kwargs["layer_id"]]
 
@@ -578,7 +518,6 @@ class AdaLNMixin(BaseMixin):
         attention_output = layer.attention(attention_input, mask, **kwargs)
         text_attention_output = attention_output[:, :text_length]  # (b,n,d)
         img_attention_output = attention_output[:, text_length:]  # (b,(t n),d)
-
         if self.transformer.layernorm_order == "sandwich":
             text_attention_output = layer.third_layernorm(text_attention_output)
             img_attention_output = layer.third_layernorm(img_attention_output)
@@ -834,6 +773,15 @@ class DiffusionTransformer(BaseModel):
         b, t, d, h, w = x.shape
         if x.dtype != self.dtype:
             x = x.to(self.dtype)
+
+        # This is not use in inference
+        if "concat_images" in kwargs and kwargs["concat_images"] is not None:
+            if kwargs["concat_images"].shape[0] != x.shape[0]:
+                concat_images = kwargs["concat_images"].repeat(2, 1, 1, 1, 1)
+            else:
+                concat_images = kwargs["concat_images"]
+            x = torch.cat([x, concat_images], dim=2)
+
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -854,5 +802,4 @@ class DiffusionTransformer(BaseModel):
 
         kwargs["input_ids"] = kwargs["position_ids"] = kwargs["attention_mask"] = torch.ones((1, 1)).to(x.dtype)
         output = super().forward(**kwargs)[0]
-
         return output
